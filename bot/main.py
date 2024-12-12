@@ -1,266 +1,298 @@
-import logging
-import random
-import string
-import io
+import os
+import requests
+import qrcode
+from io import BytesIO
 from telegram import (
     Update,
-    KeyboardButton,
+    InlineKeyboardButton,
+    InlineKeyboardMarkup,
     ReplyKeyboardMarkup,
-    ReplyKeyboardRemove,
+    KeyboardButton,
+    InputFile,
 )
 from telegram.ext import (
     ApplicationBuilder,
     CommandHandler,
+    CallbackQueryHandler,
     MessageHandler,
     ConversationHandler,
-    ContextTypes,
     filters,
 )
+import logging
 
-from config import TELEGRAM_TOKEN_BOT, QR_CODE_URL_DOMAIN
-from database import session
-from models import User, Booking, Link
-import qrcode
-from sqlalchemy.exc import SQLAlchemyError
+# Логирование
+logging.basicConfig(format="%(asctime)s - %(name)s - %(levelname)s - %(message)s", level=logging.INFO)
 
-# Setting up logging
-logging.basicConfig(
-    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
-    level=logging.DEBUG
-)
-logger = logging.getLogger(__name__)
+# Backend URL для взаимодействия с API
+BOT_BACKEND_URL = os.getenv("BOT_BACKEND_URL", "http://localhost:8500")
+FRONTEND_URL = os.getenv("FRONTEND_URL", "http://localhost:3000")
+BOT_USERNAME = os.getenv("BOT_USERNAME", "bot_user")
+BOT_PASSWORD = os.getenv("BOT_PASSWORD", "bot_password")
+BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
+HEADERS = {'accept': 'application/json'}
 
-# Constants for conversation states
-CONTACT, SEATS, PAYMENT = range(3)
+# Глобальная переменная для хранения токена
+AUTH_TOKEN = None
 
-# Information about the current event
-EVENT = {
-    'name': 'Концерт группы XYZ',
-    'date': '01.12.2023',
-    'available_seats': 100,
-    'price_per_seat': 1000,  # Price per seat
-}
+# Состояния для ConversationHandler
+SELECT_EVENT, GET_SEATS, GET_PHONE, GET_PAYMENT_FILE = range(4)
 
 
-# /start command handler
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user = update.effective_user
-    if EVENT:
-        message = (
-            f"Привет, {user.first_name}! "
-            f"Ближайшее мероприятие: {EVENT['name']} {EVENT['date']}."
-        )
-        await update.message.reply_text(message)
-        await request_phone_number(update, context)
-        return CONTACT
-    else:
-        await update.message.reply_text("Сейчас нет запланированных мероприятий.")
-        return ConversationHandler.END
-
-
-# Request for phone number
-async def request_phone_number(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    contact_button = KeyboardButton('Поделиться контактом', request_contact=True)
-    reply_markup = ReplyKeyboardMarkup(
-        [[contact_button]], one_time_keyboard=True, resize_keyboard=True
-    )
-    await update.message.reply_text(
-        'Пожалуйста, поделитесь своим номером телефона для продолжения.',
-        reply_markup=reply_markup
-    )
-
-
-# Handle contact sharing
-async def handle_contact(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    contact = update.message.contact
-    user_id = contact.user_id
-    phone_number = contact.phone_number
-
-    # Convert phone number to format 7xxxxxxxx
-    if phone_number.startswith('+'):
-        phone_number = phone_number[1:]
-    if phone_number.startswith('8'):
-        phone_number = '7' + phone_number[1:]
-
-    # Save user to the database
-    user = User(user_id=user_id, phone_number=phone_number)
+def get_auth_token():
+    """
+    Получение токена авторизации.
+    """
+    global AUTH_TOKEN
     try:
-        session.merge(user)
-        session.commit()
-    except SQLAlchemyError as e:
-        logger.error(f"Database error: {e}")
-        await update.message.reply_text("Произошла ошибка при сохранении данных. Попробуйте позже.")
+        response = requests.post(
+            f"{BOT_BACKEND_URL}/token",
+            data={"username": BOT_USERNAME, "password": BOT_PASSWORD},
+            headers={"Content-Type": "application/x-www-form-urlencoded"},
+        )
+        response.raise_for_status()
+        AUTH_TOKEN = response.json()["access_token"]
+        logging.info("Токен авторизации успешно получен")
+    except requests.RequestException as e:
+        logging.error(f"Ошибка при получении токена авторизации: {e}")
+        AUTH_TOKEN = None
+
+
+def make_request(method, endpoint, **kwargs):
+    """
+    Выполнение запроса к бэкенду с авторизацией.
+    """
+    global AUTH_TOKEN
+    if not AUTH_TOKEN:
+        get_auth_token()
+
+    headers = kwargs.pop("headers", {})
+    headers["Authorization"] = f"Bearer {AUTH_TOKEN}"
+
+    try:
+        response = requests.request(method, f"{BOT_BACKEND_URL}{endpoint}", headers=headers, **kwargs)
+        if response.status_code == 401:  # Если токен недействителен
+            logging.info("Токен недействителен. Обновление токена...")
+            get_auth_token()
+            headers["Authorization"] = f"Bearer {AUTH_TOKEN}"
+            response = requests.request(method, f"{BOT_BACKEND_URL}{endpoint}", headers=headers, **kwargs)
+        response.raise_for_status()
+        return response.json()
+    except requests.RequestException as e:
+        logging.error(f"Ошибка при выполнении запроса: {e}")
+        return None
+
+
+async def start(update: Update, context):
+    """
+    Обработчик команды /start.
+    """
+    events = make_request("GET", "/events")
+    if not events:
+        await update.message.reply_text("На данный момент нет доступных мероприятий.")
         return ConversationHandler.END
 
-    await update.message.reply_text(
-        'Спасибо! Сколько мест вы хотите забронировать?',
-        reply_markup=ReplyKeyboardRemove()
-    )
-    return SEATS
+    keyboard = [
+        [InlineKeyboardButton(event["name"], callback_data=event["guid"])]
+        for event in events
+    ]
+    reply_markup = InlineKeyboardMarkup(keyboard)
+
+    await update.message.reply_text("Выберите мероприятие:", reply_markup=reply_markup)
+    return SELECT_EVENT
 
 
-# Handle seat selection
-async def handle_seats(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def select_event(update: Update, context):
+    """
+    Обработчик выбора мероприятия.
+    """
+    query = update.callback_query
+    await query.answer()
+
+    event_guid = query.data
+    context.user_data["event_guid"] = event_guid
+
+    event_data = make_request("GET", f"/events/{event_guid}")
+    if not event_data:
+        await query.edit_message_text("Произошла ошибка при получении информации о мероприятии.")
+        return ConversationHandler.END
+
+    context.user_data["event_price"] = event_data["price"]
+    await query.edit_message_text(f"Вы выбрали: {event_data['name']}\n\n{event_data['text']}")
+    await update.effective_message.reply_text("Введите количество мест:")
+    return GET_SEATS
+
+
+async def get_seats(update: Update, context):
+    """
+    Обработчик указания количества мест.
+    """
     try:
         seats = int(update.message.text)
         if seats <= 0:
             raise ValueError
-
-        # Check availability
-        booked_seats = session.query(Booking).filter_by(event_name=EVENT['name']).count()
-        if booked_seats + seats > EVENT['available_seats']:
-            await update.message.reply_text(
-                f"К сожалению, доступно только {EVENT['available_seats'] - booked_seats} мест(а)."
-            )
-            return SEATS
-
-        user_id = update.effective_user.id
-
-        # Save booking to the database
-        booking = Booking(user_id=user_id, seats=seats, event_name=EVENT['name'])
-        session.add(booking)
-        session.commit()
-
-        total_price = seats * EVENT['price_per_seat']
-
-        payment_info = (
-            f"Для бронирования {seats} мест переведите {total_price} руб. на счет XXXX-YYYY-ZZZZ."
-        )
-        await update.message.reply_text(payment_info)
-        await update.message.reply_text('После оплаты отправьте файл с подтверждением (jpeg/png/pdf).')
-        return PAYMENT
     except ValueError:
-        await update.message.reply_text('Пожалуйста, введите корректное количество мест (число больше 0).')
-        return SEATS
-    except SQLAlchemyError as e:
-        logger.error(f"Database error: {e}")
-        await update.message.reply_text("Произошла ошибка при сохранении бронирования. Попробуйте позже.")
-        return ConversationHandler.END
+        await update.message.reply_text("Введите корректное количество мест (число больше 0):")
+        return GET_SEATS
+
+    context.user_data["seats"] = seats
+    context.user_data["total_cash"] = seats * context.user_data["event_price"]
+
+    contact_button = KeyboardButton("Поделиться контактом", request_contact=True)
+    reply_markup = ReplyKeyboardMarkup([[contact_button]], one_time_keyboard=True, resize_keyboard=True)
+    await update.message.reply_text("Пожалуйста, отправьте ваш номер телефона:", reply_markup=reply_markup)
+    return GET_PHONE
 
 
-# Handle payment confirmation
-async def handle_payment_confirmation(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_id = update.effective_user.id
-    booking = session.query(Booking).filter_by(user_id=user_id, payment_confirmed=False).first()
-
-    if booking:
-        file = None
-        if update.message.document:
-            file = update.message.document
-        elif update.message.photo:
-            file = update.message.photo[-1]
-        else:
-            await update.message.reply_text('Пожалуйста, отправьте файл с подтверждением оплаты (jpeg/png/pdf).')
-            return PAYMENT
-
-        # Check file format
-        if hasattr(file, 'mime_type') and file.mime_type not in ['image/jpeg', 'image/png', 'application/pdf']:
-            await update.message.reply_text('Недопустимый формат файла. Пришлите jpeg, png или pdf.')
-            return PAYMENT
-
-        # Save file locally (optional)
-        # You can implement file saving here if needed
-
-        # Mark payment as confirmed
-        booking.payment_confirmed = True
-        try:
-            session.commit()
-        except SQLAlchemyError as e:
-            logger.error(f"Database error: {e}")
-            await update.message.reply_text("Произошла ошибка при обработке оплаты. Попробуйте позже.")
-            return ConversationHandler.END
-
-        # Generate one-time link and QR code
-        link_url = await generate_one_time_link(user_id)
-        qr_image = generate_qr_code(link_url)
-
-        await update.message.reply_photo(photo=qr_image)
-        await update.message.reply_text(
-            'Оплата подтверждена! Вот ваш QR-код с одноразовой ссылкой.'
-        )
-        return ConversationHandler.END
+async def get_phone(update: Update, context):
+    """
+    Обработчик получения номера телефона.
+    """
+    if update.message.contact:
+        phone = update.message.contact.phone_number
     else:
+        phone = update.message.text
+
+    context.user_data["phone"] = phone
+    user_nickname = update.effective_user.username
+    context.user_data["user_nickname"] = user_nickname
+
+    await update.message.reply_text(
+        f"Отправьте файл (PDF, JPEG или PNG) с подтверждением перевода на сумму {context.user_data['total_cash']}."
+    )
+    return GET_PAYMENT_FILE
+
+
+async def get_payment_file(update, context):
+    """Обработчик получения файла подтверждения оплаты с авторизацией."""
+    file = None
+
+    # Получение документа или фотографии
+    if update.message.document:
+        file = update.message.document
+    elif update.message.photo:
+        file = update.message.photo[-1]  # Берём последнее изображение (высокое разрешение)
+
+    if not file:
+        await update.message.reply_text("Отправьте файл в формате PDF, JPEG или PNG.")
+        return GET_PAYMENT_FILE
+
+    # Проверка доступности мест
+    event_guid = context.user_data["event_guid"]
+    seats_requested = context.user_data["seats"]
+
+    # Запрашиваем существующие бронирования для мероприятия
+    bookings = make_request("GET", f"/bookings/", params={"event_guid": event_guid})
+
+    # Проверяем, что запрос выполнен успешно
+    if bookings is None:
+        await update.message.reply_text("Произошла ошибка при проверке доступности мест.")
+        return ConversationHandler.END
+
+    # Если бронирования отсутствуют, считаем, что занятых мест нет
+    total_booked = sum(booking["count_seats"] for booking in bookings) if bookings else 0
+
+    # Запрашиваем данные о мероприятии
+    event_data = make_request("GET", f"/events/{event_guid}")
+    if not event_data:
+        await update.message.reply_text("Произошла ошибка при получении информации о мероприятии.")
+        return ConversationHandler.END
+
+    max_seats = event_data["max_seats"]
+
+    if total_booked + seats_requested > max_seats:
         await update.message.reply_text(
-            'Вы еще не сделали бронирование или оплата уже подтверждена.'
+            f"Недостаточно свободных мест. Доступно: {max_seats - total_booked} мест."
         )
         return ConversationHandler.END
 
+    # Шаг 1: Создание бронирования
+    payload = {
+        "event_guid": event_guid,
+        "user_phone": context.user_data["phone"],
+        "user_nickname": context.user_data.get("user_nickname"),
+        "count_seats": seats_requested,
+        "total_cash": context.user_data["total_cash"],
+    }
+    booking_data = make_request("POST", "/bookings", json=payload)
 
-# Generate one-time link
-async def generate_one_time_link(user_id):
-    token = ''.join(random.choices(string.ascii_letters + string.digits, k=16))
-    link = Link(user_id=user_id, token=token, expired=False)
-    try:
-        session.add(link)
-        session.commit()
-    except SQLAlchemyError as e:
-        logger.error(f"Database error: {e}")
-    # Replace 'yourdomain.com' with your actual domain or IP address
-    return f"http://{QR_CODE_URL_DOMAIN}/confirm/{token}"
+    if not booking_data:
+        await update.message.reply_text(
+            "Произошла ошибка при создании бронирования. Попробуйте ещё раз."
+        )
+        return ConversationHandler.END
 
+    booking_guid = booking_data["guid"]
+    context.user_data["booking_guid"] = booking_guid
 
-# Generate QR code
-def generate_qr_code(link):
-    qr = qrcode.QRCode(version=1, box_size=10, border=5)
-    qr.add_data(link)
+    # Шаг 2: Загрузка файла оплаты
+    file_id = file.file_id
+    new_file = await context.bot.get_file(file_id)  # Используем context.bot
+    file_data = requests.get(new_file.file_path).content
+
+    files = {"file": (file.file_name if hasattr(file, "file_name") else "payment_confirmation.jpg", file_data)}
+    upload_response = make_request(
+        "POST",
+        f"/bookings/{booking_guid}/upload-payment-file",
+        files=files,
+    )
+
+    if not upload_response:
+        await update.message.reply_text(
+            "Произошла ошибка при загрузке файла. Попробуйте ещё раз."
+        )
+        return ConversationHandler.END
+
+    # Шаг 3: Генерация QR-кода с фронтенд-ссылкой
+    frontend_booking_url = f"{FRONTEND_URL}/booking/{booking_guid}"
+    qr = qrcode.QRCode(version=1, box_size=10, border=4)
+    qr.add_data(frontend_booking_url)
     qr.make(fit=True)
-    img = qr.make_image(fill_color='black', back_color='white')
-    bio = io.BytesIO()
-    img.save(bio, format='PNG')
+
+    img = qr.make_image(fill="black", back_color="white")
+    bio = BytesIO()
+    bio.name = "qr_code.png"
+    img.save(bio, "PNG")
     bio.seek(0)
-    return bio
 
-
-# Handle unexpected input in CONTACT state
-async def handle_unexpected_contact_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text('Пожалуйста, поделитесь своим номером телефона, используя кнопку ниже.')
-    await request_phone_number(update, context)
-    return CONTACT
-
-
-# Handle unexpected input in PAYMENT state
-async def handle_unexpected_payment_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text('Пожалуйста, отправьте файл с подтверждением оплаты (jpeg/png/pdf).')
-    return PAYMENT
-
-
-# Command handler for /cancel
-async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text('Операция отменена.', reply_markup=ReplyKeyboardRemove())
+    # Отправка QR-кода пользователю
+    await update.message.reply_photo(photo=InputFile(bio), caption="Ваше бронирование успешно создано!")
     return ConversationHandler.END
 
 
-# Main function
-def main():
-    # Replace 'YOUR_TELEGRAM_BOT_TOKEN' with your actual bot token
-    application = ApplicationBuilder().token(TELEGRAM_TOKEN_BOT).build()
+async def cancel(update: Update, context):
+    """
+    Обработчик отмены процесса.
+    """
+    await update.message.reply_text("Операция отменена.")
+    return ConversationHandler.END
 
-    # Define ConversationHandler with states CONTACT, SEATS, PAYMENT
+
+def main():
+    """
+    Запуск Telegram-бота.
+    """
+    application = ApplicationBuilder().token(BOT_TOKEN).build()
+
     conv_handler = ConversationHandler(
-        entry_points=[CommandHandler('start', start)],
+        entry_points=[CommandHandler("start", start)],
         states={
-            CONTACT: [
-                MessageHandler(filters.CONTACT, handle_contact),
-                MessageHandler(filters.ALL & ~filters.COMMAND, handle_unexpected_contact_input),
+            SELECT_EVENT: [CallbackQueryHandler(select_event)],
+            GET_SEATS: [MessageHandler(filters.TEXT & ~filters.COMMAND, get_seats)],
+            GET_PHONE: [
+                MessageHandler(filters.CONTACT, get_phone),
+                MessageHandler(filters.TEXT & ~filters.COMMAND, get_phone),
             ],
-            SEATS: [MessageHandler(filters.TEXT & ~filters.COMMAND, handle_seats)],
-            PAYMENT: [
-                MessageHandler(
-                    (filters.Document.ALL | filters.PHOTO) & ~filters.COMMAND,
-                    handle_payment_confirmation
-                ),
-                MessageHandler(filters.ALL & ~filters.COMMAND, handle_unexpected_payment_input),
+            GET_PAYMENT_FILE: [
+                MessageHandler(filters.Document.ALL | filters.PHOTO, get_payment_file)
             ],
         },
-        fallbacks=[CommandHandler('cancel', cancel)],
+        fallbacks=[CommandHandler("cancel", cancel)],
     )
 
-    # Add ConversationHandler to the application
     application.add_handler(conv_handler)
 
-    # Run the bot
     application.run_polling()
 
 
-if __name__ == '__main__':
+if __name__ == "__main__":
     main()
